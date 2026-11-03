@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0,
+          maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>AR Параллакс Картина</title>
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+
+        /* Экран загрузки */
+        #overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.92);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+            color: #fff;
+            padding: 30px;
+            text-align: center;
+        }
+
+        #overlay.hidden { display: none; }
+
+        #overlay h1 {
+            font-size: 22px;
+            margin-bottom: 10px;
+        }
+
+        #overlay p {
+            font-size: 15px;
+            color: #aaa;
+            line-height: 1.6;
+            max-width: 320px;
+        }
+
+        .spinner {
+            width: 40px; height: 40px;
+            border: 3px solid #333;
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-bottom: 20px;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        #start-btn {
+            margin-top: 25px;
+            padding: 16px 50px;
+            font-size: 17px;
+            font-weight: 600;
+            background: #34c759;
+            color: #fff;
+            border: none;
+            border-radius: 14px;
+            cursor: pointer;
+            display: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        #start-btn:active { background: #2da44e; }
+
+        #status {
+            margin-top: 15px;
+            font-size: 13px;
+            color: #888;
+        }
+
+        /* Подсказка */
+        #hint {
+            position: fixed;
+            top: max(env(safe-area-inset-top, 10px), 10px);
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.75);
+            color: #fff;
+            padding: 10px 22px;
+            border-radius: 25px;
+            font-size: 14px;
+            z-index: 9999;
+            pointer-events: none;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            transition: opacity 0.6s;
+            white-space: nowrap;
+        }
+
+        #hint.hidden { opacity: 0; }
+
+        /* Отладка */
+        #debug {
+            position: fixed;
+            bottom: max(env(safe-area-inset-bottom, 8px), 8px);
+            left: 8px;
+            color: #0f0;
+            font-size: 11px;
+            font-family: monospace;
+            z-index: 9999;
+            background: rgba(0,0,0,0.6);
+            padding: 4px 8px;
+            border-radius: 4px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Оверлей загрузки -->
+    <div id="overlay">
+        <div class="spinner" id="spinner"></div>
+        <h1>AR Параллакс</h1>
+        <p>Наведите камеру на картину, чтобы увидеть эффект глубины</p>
+        <button id="start-btn">Запустить AR</button>
+        <div id="status">Подготовка...</div>
+    </div>
+
+    <div id="hint" class="hidden">📷 Наведите на картину</div>
+    <div id="debug"></div>
+
+    <!-- MindAR (включает Three.js внутри) -->
+    <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"></script>
+
+    <script>
+    (async function () {
+        'use strict';
+
+        // =============================================
+        //  НАСТРОЙКИ — ИЗМЕНИТЕ ПОД СВОЙ ПРОЕКТ
+        // =============================================
+        const CFG = {
+            // Путь к скомпилированному файлу целевого изображения
+            targetsFile: 'targets.mind',
+
+            // Индекс изображения в .mind файле (0 = первое)
+            targetIndex: 0,
+
+            // Пути к параллакс-слоям
+            layers: {
+                back:  'images/layer-back.png',
+                mid:   'images/layer-mid.png',
+                front: 'images/layer-front.png'
+            },
+
+            // Соотношение сторон целевого изображения (ширина / высота)
+            // Измерьте вашу картину! Например: 80см × 60см = 1.33
+            aspectRatio: 1.33,
+
+            // Глубина слоёв (отрицательное = дальше от зрителя)
+            zDepth: {
+                back:  -0.06,
+                mid:   -0.03,
+                front:  0.0
+            },
+
+            // Увеличение слоёв (задний больше → виден при смещении)
+            layerScale: {
+                back:  1.40,
+                mid:   1.20,
+                front: 1.02
+            },
+
+            // Сила параллакса (пиксели смещения на градус наклона)
+            parallaxStrength: {
+                back:  0.025,
+                mid:   0.012,
+                front: 0.0
+            },
+
+            // Ширина рамки в 3D-единицах (подгонится под маркер)
+            frameWidth: 1.0
+        };
+
+        // =============================================
+        //  DOM
+        // =============================================
+        const overlay  = document.getElementById('overlay');
+        const spinner  = document.getElementById('spinner');
+        const startBtn = document.getElementById('start-btn');
+        const statusEl = document.getElementById('status');
+        const hintEl   = document.getElementById('hint');
+        const debugEl  = document.getElementById('debug');
+
+        function setStatus(msg) {
+            statusEl.textContent = msg;
+            debugEl.textContent = msg;
+            console.log('[AR]', msg);
+        }
+
+        // =============================================
+        //  Гироскоп (с запросом на iOS)
+        // =============================================
+        const gyro = { x: 0, y: 0 };
+        let gyroBase = null;
+
+        async function initGyroscope() {
+            // iOS 13+ требует явного разрешения
+            if (typeof DeviceOrientationEvent !== 'undefined' &&
+                typeof DeviceOrientationEvent.requestPermission === 'function') {
+                try {
+                    const perm = await DeviceOrientationEvent.requestPermission();
+                    if (perm !== 'granted') {
+                        setStatus('Гироскоп отклонён — параллакс не будет работать');
+                        return;
+                    }
+                } catch (e) {
+                    setStatus('Ошибка гироскопа: ' + e.message);
+                    return;
+                }
+            }
+
+            window.addEventListener('deviceorientation', (e) => {
+                if (e.gamma === null) return;
+
+                if (!gyroBase) {
+                    gyroBase = { beta: e.beta, gamma: e.gamma };
+                }
+
+                // Нормализуем: ±1 при наклоне ~30°
+                gyro.x = clamp((e.gamma - gyroBase.gamma) / 30, -1, 1);
+                gyro.y = clamp((e.beta  - gyroBase.beta)  / 30, -1, 1);
+            }, true);
+
+            setStatus('Гироскоп активен');
+        }
+
+        function clamp(v, min, max) {
+            return Math.max(min, Math.min(max, v));
+        }
+
+        // =============================================
+        //  Запуск
+        // =============================================
+        const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+        if (isIOS) {
+            // iOS: нужен тап пользователя для камеры + гироскопа
+            spinner.style.display = 'none';
+            startBtn.style.display = 'block';
+            setStatus('Нажмите кнопку для запуска');
+
+            startBtn.addEventListener('click', async () => {
+                startBtn.disabled = true;
+                startBtn.textContent = 'Запуск...';
+                await initGyroscope();
+                await launchAR();
+            }, { once: true });
+        } else {
+            // Android: запускаем сразу
+            await initGyroscope();
+            await launchAR();
+        }
+
+        // =============================================
+        //  Инициализация MindAR + Three.js
+        // =============================================
+        async function launchAR() {
+            setStatus('Инициализация AR...');
+
+            let mindarThree;
+            try {
+                mindarThree = new window.MINDAR.IMAGE.MindARThree({
+                    container: document.body,
+                    imageTargetSrc: CFG.targetsFile,
+                    // Фильтр стабилизации (меньше = стабильнее, но медленнее)
+                    filterMinCF: 0.001,
+                    filterBeta: 10,
+                    // Не показывать UI MindAR
+                    uiLoading: 'no',
+                    uiScanning: 'no',
+                    uiError: 'no'
+                });
+            } catch (e) {
+                setStatus('Ошибка инициализации: ' + e.message);
+                return;
+            }
+
+            const { renderer, scene, camera } = mindarThree;
+
+            // Включаем стенсил для маски
+            const gl = renderer.getContext();
+            gl.enable(gl.STENCIL_TEST);
+
+            setStatus('Загрузка слоёв...');
+
+            // =============================================
+            //  Загрузка текстур
+            // =============================================
+            const texLoader = new THREE.TextureLoader();
+
+            function loadTexture(url) {
+                return new Promise((resolve, reject) => {
+                    texLoader.load(
+                        url,
+                        (tex) => {
+                            tex.minFilter = THREE.LinearFilter;
+                            tex.magFilter = THREE.LinearFilter;
+                            resolve(tex);
+                        },
+                        undefined,
+                        () => reject(new Error('Не загружен: ' + url))
+                    );
+                });
+            }
+
+            let textures;
+            try {
+                textures = {
+                    back:  await loadTexture(CFG.layers.back),
+                    mid:   await loadTexture(CFG.layers.mid),
+                    front: await loadTexture(CFG.layers.front)
+                };
+            } catch (e) {
+                setStatus('Ошибка загрузки: ' + e.message);
+                return;
+            }
+
+            setStatus('Построение сцены...');
+
+            // =============================================
+            //  Построение параллакс-картины
+            // =============================================
+            const fw = CFG.frameWidth;
+            const fh = fw / CFG.aspectRatio;
+
+            // Якорь — привязка к распознанному изображению
+            const anchor = mindarThree.addAnchor(CFG.targetIndex);
+
+            // Корневая группа всей картины
+            const artGroup = new THREE.Group();
+            anchor.group.add(artGroup);
+
+            // --- Стенсил-маска (невидимая рамка) ---
+            const maskGeo = new THREE.PlaneGeometry(fw, fh);
+            const maskMat = new THREE.MeshBasicMaterial({
+                colorWrite: false,
+                depthWrite: false,
+                stencilWrite: true,
+                stencilRef: 1,
+                stencilFunc: THREE.AlwaysStencilFunc,
+                stencilZPass: THREE.ReplaceStencilOp
+            });
+            const maskMesh = new THREE.Mesh(maskGeo, maskMat);
+            maskMesh.position.z = 0.005;
+            maskMesh.renderOrder = 0;
+            artGroup.add(maskMesh);
+
+            // --- Слои ---
+            const layerMeshes = {};
+
+            function createLayer(name, texture) {
+                const cfg = CFG;
+                const w = fw * cfg.layerScale[name];
+                const h = fh * cfg.layerScale[name];
+
+                const geo = new THREE.PlaneGeometry(w, h);
+                const mat = new THREE.MeshBasicMaterial({
+                    map: texture,
+                    transparent: true,
+                    side: THREE.FrontSide,
+                    depthWrite: false,
+                    // Стенсил: рисуем только внутри маски
+                    stencilWrite: false,
+                    stencilRef: 1,
+                    stencilFunc: THREE.EqualStencilFunc
+                });
+
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.z = cfg.zDepth[name];
+                mesh.renderOrder = name === 'back' ? 1 : name === 'mid' ? 2 : 3;
+
+                layerMeshes[name] = mesh;
+                artGroup.add(mesh);
+            }
+
+            createLayer('back',  textures.back);
+            createLayer('mid',   textures.mid);
+            createLayer('front', textures.front);
+
+            // --- Декоративная рамка ---
+            const borderW = 0.015;
+            const borderMat = new THREE.MeshBasicMaterial({
+                color: 0x1c1c1e,
+                side: THREE.FrontSide
+            });
+
+            function addFrame(x, y, w, h) {
+                const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), borderMat);
+                m.position.set(x, y, 0.006);
+                m.renderOrder = 10;
+                artGroup.add(m);
+            }
+
+            addFrame(0,  fh/2 + borderW/2, fw + borderW*2, borderW); // верх
+            addFrame(0, -fh/2 - borderW/2, fw + borderW*2, borderW); // низ
+            addFrame(-fw/2 - borderW/2, 0, borderW, fh);              // лево
+            addFrame( fw/2 + borderW/2, 0, borderW, fh);              // право
+
+            // =============================================
+            //  События трекинга
+            // =============================================
+            let isTracking = false;
+
+            anchor.onTargetFound = () => {
+                isTracking = true;
+                hintEl.textContent = '🎨 Наклоняйте телефон!';
+                hintEl.classList.remove('hidden');
+                setStatus('✅ Изображение распознано');
+            };
+
+            anchor.onTargetLost = () => {
+                isTracking = false;
+                hintEl.textContent = '📷 Наведите на картину';
+                hintEl.classList.remove('hidden');
+                setStatus('🔍 Ищу изображение...');
+            };
+
+            // =============================================
+            //  Запуск AR
+            // =============================================
+            setStatus('Запуск камеры...');
+
+            try {
+                await mindarThree.start();
+            } catch (e) {
+                setStatus('Ошибка камеры: ' + e.message);
+                alert('Не удалось запустить камеру.\n\n' +
+                      'Убедитесь:\n' +
+                      '• Сайт открыт через HTTPS\n' +
+                      '• Вы разрешили доступ к камере\n' +
+                      '• Камера не занята другим приложением');
+                return;
+            }
+
+            // Скрыть оверлей
+            overlay.classList.add('hidden');
+            hintEl.classList.remove('hidden');
+            setStatus('🔍 Наведите на картину');
+
+            // =============================================
+            //  Рендер-цикл
+            // =============================================
+            renderer.setAnimationLoop(() => {
+                // Обновляем параллакс только когда изображение видно
+                if (isTracking) {
+                    for (const name of ['back', 'mid', 'front']) {
+                        const mesh = layerMeshes[name];
+                        const strength = CFG.parallaxStrength[name];
+                        mesh.position.x =  gyro.x * strength;
+                        mesh.position.y = -gyro.y * strength;
+                    }
+                }
+
+                gl.enable(gl.STENCIL_TEST);
+                renderer.render(scene, camera);
+            });
+        }
+
+    })();
+    </script>
+</body>
+</html>
